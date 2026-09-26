@@ -1,8 +1,0 @@
-metric	value
-source1_rows	2206821
-source2_rows	5034616
-source3_rows	5285603
-ground_truth_rows	2206821
-ground_truth_unique_s1	2206821
-ground_truth_with_matches	2083574
-singletons	123247
