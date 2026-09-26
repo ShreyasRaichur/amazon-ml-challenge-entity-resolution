@@ -703,15 +703,9 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
             uint32_t rec_idx = (uint32_t)target_index.records.size();
 
             if (src_type == 2) {
-                // S2 exact root name & acronym index
+                // S2 exact root name index
                 if (!root_name.empty()) {
                     auto& list = target_index.exact_name_map_s2[root_name];
-                    if (list.size() < rules.max_exact_posting_size) {
-                        list.push_back(rec_idx);
-                    }
-                }
-                if (!acronym.empty()) {
-                    auto& list = target_index.exact_name_map_s2[acronym];
                     if (list.size() < rules.max_exact_posting_size) {
                         list.push_back(rec_idx);
                     }
@@ -724,15 +718,9 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     }
                 }
             } else {
-                // S3 exact root name & acronym index
+                // S3 exact root name index
                 if (!root_name.empty()) {
                     auto& list = target_index.exact_name_map_s3[root_name];
-                    if (list.size() < rules.max_exact_posting_size) {
-                        list.push_back(rec_idx);
-                    }
-                }
-                if (!acronym.empty()) {
-                    auto& list = target_index.exact_name_map_s3[acronym];
                     if (list.size() < rules.max_exact_posting_size) {
                         list.push_back(rec_idx);
                     }
@@ -805,12 +793,15 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
                     }
-                    if (!s1.acronym.empty()) {
-                        auto it = target_index.exact_name_map_s2.find(s1.acronym);
+                    // ========================================================
+                    // 1. Search Source 2 Candidates
+                    // ========================================================
+                    if (!s1.root_name.empty()) {
+                        auto it = target_index.exact_name_map_s2.find(s1.root_name);
                         if (it != target_index.exact_name_map_s2.end()) {
                             for (uint32_t tid : it->second) {
                                 if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
-                                overlap_counts[tid] = 9998;
+                                overlap_counts[tid] = 9999;
                             }
                         }
                     }
@@ -833,8 +824,6 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         double base_name = 0.0;
                         if (overlap >= 9999 || (!s1_rec.root_name.empty() && s1_rec.root_name == target.root_name)) {
                             base_name = 1.0;
-                        } else if (overlap == 9998 || (!s1_rec.acronym.empty() && s1_rec.acronym == target.root_name) || (!target.acronym.empty() && target.acronym == s1_rec.root_name)) {
-                            base_name = 0.88;
                         } else {
                             size_t union_size = s1_rec.tokens.size() + target.tokens.size() - overlap;
                             double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
@@ -842,7 +831,13 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             if (jaccard >= 0.20 || overlap >= 1) {
                                 jw = fast_jaro_winkler(s1_rec.root_name.c_str(), target.root_name.c_str());
                             }
-                            base_name = std::max(jaccard, jw);
+                            if (jaccard >= 0.75 || jw >= 0.92) {
+                                base_name = std::max(jaccard, jw);
+                            } else if (jaccard >= 0.50 || jw >= 0.85) {
+                                base_name = 0.40 * jaccard + 0.60 * jw;
+                            } else {
+                                base_name = 0.35 * std::max(jaccard, jw);
+                            }
                         }
 
                         // Numeric Street Number Check
@@ -865,6 +860,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         }
 
                         // Address / Locality Token Check
+                        int addr_agree = 0;
                         int addr_overlap = 0;
                         if (!s1_rec.addr_hashes.empty() && !target.addr_hashes.empty()) {
                             for (uint32_t h1 : s1_rec.addr_hashes) {
@@ -872,13 +868,11 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     if (h1 == h2) { addr_overlap++; break; }
                                 }
                             }
-                        }
-
-                        int addr_agree = 0;
-                        if (s1_rec.addr_hashes.size() >= 2 && target.addr_hashes.size() >= 2) {
-                            addr_agree = (addr_overlap >= 1) ? 1 : -1;
-                        } else if (addr_overlap >= 1) {
-                            addr_agree = 1;
+                            if (addr_overlap >= 1) {
+                                addr_agree = 1;
+                            } else {
+                                addr_agree = -1; // Contradictory localities
+                            }
                         }
 
                         // Composite Discriminator Score with Singleton Protections
@@ -893,9 +887,14 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         else if (addr_agree == -1) score += rules.addr_penalty;
 
                         // Hard penalties for compound contradictions (prevents spurious singleton matches)
-                        if (postal_agree == -1 && addr_agree == -1) score -= 0.25;
-                        if (sn_agree == -1 && addr_agree == -1) score -= 0.25;
-                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
+                        if (postal_agree == -1 && addr_agree == -1) score -= 0.30;
+                        if (sn_agree == -1 && addr_agree == -1) score -= 0.30;
+                        if (postal_agree == -1 && sn_agree == -1) score -= 0.30;
+
+                        // Uncorroborated Non-Exact Name Penalty
+                        if (base_name < 0.95 && postal_agree <= 0 && sn_agree <= 0 && addr_agree <= 0) {
+                            score -= 0.25;
+                        }
 
                         return std::max(0.0, std::min(1.0, score));
                     };
@@ -922,15 +921,6 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             for (uint32_t tid : it->second) {
                                 if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
                                 overlap_counts[tid] = 9999;
-                            }
-                        }
-                    }
-                    if (!s1.acronym.empty()) {
-                        auto it = target_index.exact_name_map_s3.find(s1.acronym);
-                        if (it != target_index.exact_name_map_s3.end()) {
-                            for (uint32_t tid : it->second) {
-                                if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
-                                overlap_counts[tid] = 9998;
                             }
                         }
                     }
@@ -996,7 +986,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
-                        // Tripartite mutual agreement boost for S3 candidates
+                        // Tripartite mutual agreement boost for S3 candidates (requires name AND address)
                         for (auto& s3_pair : s3_scores) {
                             const auto& s3_rec = target_index.records[s3_pair.first];
                             bool name_agree = (!top_s2.root_name.empty() && top_s2.root_name == s3_rec.root_name);
@@ -1010,7 +1000,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     if (sn_agree) break;
                                 }
                             }
-                            if (name_agree || postal_agree || sn_agree) {
+                            if (name_agree && (postal_agree || sn_agree)) {
                                 s3_pair.second = std::min(1.0, s3_pair.second + 0.15); // Tripartite confirmation boost
                             }
                         }

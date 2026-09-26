@@ -19,9 +19,13 @@ from typing import Any, Dict, List, Set, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
+import random
 import numpy as np
 import pandas as pd
+
+# Pin global random seed for 100% deterministic reproducibility
+random.seed(42)
+np.random.seed(42)
 
 from src.blocking import CountryPartitionedBlocker
 from src.config import DEFAULT_CONFIG

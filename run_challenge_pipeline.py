@@ -57,6 +57,13 @@ def print_banner(text: str) -> None:
 
 
 def main() -> None:
+    # Pin global random seeds for full reproducibility
+    import random
+    import numpy as np
+    random.seed(42)
+    np.random.seed(42)
+    os.environ["PYTHONHASHSEED"] = "42"
+
     parser = argparse.ArgumentParser(
         description="Autonomous Business Entity Resolution: ML Tuning & Direct C++ Inference Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter

@@ -172,14 +172,14 @@ class TripartiteGraphResolver:
                         if not r3:
                             continue
                         consistency = self.check_target_mutual_consistency(r2, r3)
-                        if consistency < 0.35:
-                            # Contradiction detected between S2 and S3 targets
-                            # Keep only the target with higher confidence link
+                        # Only discard if there is an irreconcilable cross-country contradiction (< 0.15)
+                        # and one of the links is distinctly weaker (< 0.65)
+                        if consistency < 0.15:
                             p2 = next((p for c, p in s1_candidates[s1_id] if c == s2_id), 0.0)
                             p3 = next((p for c, p in s1_candidates[s1_id] if c == s3_id), 0.0)
-                            if p2 >= p3:
+                            if p2 >= p3 and p3 < 0.65:
                                 valid_cands.discard(s3_id)
-                            else:
+                            elif p3 > p2 and p2 < 0.65:
                                 valid_cands.discard(s2_id)
 
             # Ensure strict subset property
