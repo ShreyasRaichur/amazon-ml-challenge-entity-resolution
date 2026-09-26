@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C++ compiled libraries and object files
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+models/*.dylib
+models/*.so
+models/*.dll
+
+# Large Competition Datasets (2.3 GB)
+data/student_resource/dataset/
+*.tsv
+*.csv
+!tests/test_data/*.csv
+!tests/test_data/*.tsv
+
+# Output directory generated submissions (500 MB+)
+output/*.tsv
+output/*.csv
+output/*.png
+!output/.gitkeep
+
+# Cache & Temporary Directories
+cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Environments & IDEs
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
