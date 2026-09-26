@@ -1,0 +1,6 @@
+entity_id,name,address,city,state,postal_code,country,phone
+S1-101,Apple Inc.,1 Infinite Loop,Cupertino,CA,95014,US,4089961010
+S1-102,Tata Consultancy Services Ltd,Birlabagh Fort,Mumbai,MH,400001,India,9820011223
+S1-103,L'Oréal SA,41 Rue Martre,Clichy,IDF,92117,France,33147567000
+S1-104,Boulangerie Paul SAS,12 Avenue Victor Hugo,Paris,IDF,75116,France,33145000000
+S1-105,Lonely Singleton Enterprise LLC,999 Remote Desolate Way,Nome,AK,99762,US,9074430000

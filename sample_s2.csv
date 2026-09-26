@@ -1,0 +1,6 @@
+entity_id,name,address,city,state,postal_code,country,phone
+S2-201,Apple Incorporated,1 Infinite Loop Dr,Cupertino,CA,95014,United States,(408) 996-1010
+S2-202,TCS Pvt Ltd,Birlabagh,Mumbai,Maharashtra,400001,IN,+91 9820011223
+S2-203,L'Oreal,41 Rue Martre,Clichy,,92117,FR,0147567000
+S2-204,Boulangerie Paul,12 Av Victor Hugo,Paris,,75116,France,
+S2-999,Completely Unrelated Corp,500 Elm Street,Dallas,TX,75201,US,2145550199

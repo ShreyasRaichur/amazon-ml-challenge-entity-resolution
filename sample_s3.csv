@@ -1,0 +1,5 @@
+entity_id,name,address,city,state,postal_code,country,phone
+S3-301,Apple,One Infinite Loop,Cupertino,California,95014,USA,408-996-1010
+S3-302,Tata Consultancy Services,Fort Birlabagh Rd,Bombay,MH,400001,India,
+S3-303,L'Oreal SA France,41 R. Martre,Clichy,IDF,92117,FRA,+33 1 47 56 70 00
+S3-304,Paul Boulangerie SASU,12 Ave Victor Hugo,Paris,Paris,75116,FR,0145000000
