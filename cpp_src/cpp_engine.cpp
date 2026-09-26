@@ -275,6 +275,7 @@ struct TargetRecord {
     std::vector<std::string> tokens;
     std::vector<std::string> street_nums;
     std::string postal_code;
+    uint8_t source_type; // 2 for Source 2, 3 for Source 3
 };
 
 // Structure for Reference entity (S1)
@@ -288,16 +289,18 @@ struct S1Record {
     std::string postal_code;
 };
 
-// Per-country target index
+// Per-country target index with dedicated dual-source inverted maps (prevents S2 from starving S3)
 struct CountryTargetIndex {
     std::vector<TargetRecord> records;
-    std::unordered_map<std::string, std::vector<uint32_t>> exact_name_map;
-    std::unordered_map<std::string, std::vector<uint32_t>> token_inverted_index;
+    std::unordered_map<std::string, std::vector<uint32_t>> exact_name_map_s2;
+    std::unordered_map<std::string, std::vector<uint32_t>> exact_name_map_s3;
+    std::unordered_map<std::string, std::vector<uint32_t>> token_inverted_index_s2;
+    std::unordered_map<std::string, std::vector<uint32_t>> token_inverted_index_s3;
 };
 
 // Resolution rules configuration
 struct ResolutionRules {
-    double match_threshold = 0.82;
+    double match_threshold = 0.80;
     double min_candidate_score = 0.35;
     double exact_name_score = 1.0;
     double street_num_bonus = 0.15;
@@ -610,6 +613,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
     }
 
     for (const char* target_path : {s2_tsv_path, s3_tsv_path}) {
+        uint8_t src_type = (std::strcmp(target_path, s2_tsv_path) == 0) ? 2 : 3;
         std::ifstream tgt_file(target_path);
         if (!tgt_file.is_open()) continue;
 
@@ -640,29 +644,51 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
 
             uint32_t rec_idx = (uint32_t)target_index.records.size();
 
-            // Exact root name index
-            if (!root_name.empty()) {
-                auto& list = target_index.exact_name_map[root_name];
-                if (list.size() < rules.max_exact_posting_size) {
-                    list.push_back(rec_idx);
+            if (src_type == 2) {
+                // S2 exact root name & acronym index
+                if (!root_name.empty()) {
+                    auto& list = target_index.exact_name_map_s2[root_name];
+                    if (list.size() < rules.max_exact_posting_size) {
+                        list.push_back(rec_idx);
+                    }
                 }
-            }
-            if (!acronym.empty()) {
-                auto& list = target_index.exact_name_map[acronym];
-                if (list.size() < rules.max_exact_posting_size) {
-                    list.push_back(rec_idx);
+                if (!acronym.empty()) {
+                    auto& list = target_index.exact_name_map_s2[acronym];
+                    if (list.size() < rules.max_exact_posting_size) {
+                        list.push_back(rec_idx);
+                    }
+                }
+                // S2 inverted token index
+                for (const auto& tok : tokens) {
+                    auto& post = target_index.token_inverted_index_s2[tok];
+                    if (post.size() < rules.max_posting_list_size) {
+                        post.push_back(rec_idx);
+                    }
+                }
+            } else {
+                // S3 exact root name & acronym index
+                if (!root_name.empty()) {
+                    auto& list = target_index.exact_name_map_s3[root_name];
+                    if (list.size() < rules.max_exact_posting_size) {
+                        list.push_back(rec_idx);
+                    }
+                }
+                if (!acronym.empty()) {
+                    auto& list = target_index.exact_name_map_s3[acronym];
+                    if (list.size() < rules.max_exact_posting_size) {
+                        list.push_back(rec_idx);
+                    }
+                }
+                // S3 inverted token index
+                for (const auto& tok : tokens) {
+                    auto& post = target_index.token_inverted_index_s3[tok];
+                    if (post.size() < rules.max_posting_list_size) {
+                        post.push_back(rec_idx);
+                    }
                 }
             }
 
-            // Inverted token index
-            for (const auto& tok : tokens) {
-                auto& post = target_index.token_inverted_index[tok];
-                if (post.size() < rules.max_posting_list_size) {
-                    post.push_back(rec_idx);
-                }
-            }
-
-            target_index.records.push_back({std::move(id), std::move(root_name), std::move(acronym), std::move(tokens), std::move(street_nums), std::move(postal)});
+            target_index.records.push_back({std::move(id), std::move(root_name), std::move(acronym), std::move(tokens), std::move(street_nums), std::move(postal), src_type});
         }
         tgt_file.close();
     }
@@ -691,50 +717,51 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
             workers.emplace_back([&, start_idx, end_idx, n_targets]() {
                 // Thread-local scratch buffers (allocated ONCE per thread)
                 std::vector<int> overlap_counts(n_targets, 0);
-                std::vector<uint32_t> touched;
-                touched.reserve(512);
-                std::vector<std::pair<uint32_t, double>> cand_scores;
-                cand_scores.reserve(256);
+                std::vector<uint32_t> touched_s2;
+                touched_s2.reserve(256);
+                std::vector<uint32_t> touched_s3;
+                touched_s3.reserve(256);
+
+                std::vector<std::pair<uint32_t, double>> s2_scores;
+                s2_scores.reserve(64);
+                std::vector<std::pair<uint32_t, double>> s3_scores;
+                s3_scores.reserve(64);
 
                 for (size_t k = start_idx; k < end_idx; ++k) {
                     size_t s1_idx = s1_indices[k];
                     const auto& s1 = s1_records[s1_idx];
-                    cand_scores.clear();
-                    touched.clear();
+                    s2_scores.clear();
+                    s3_scores.clear();
+                    touched_s2.clear();
+                    touched_s3.clear();
 
-                    // 1. Exact root name matches
+                    // ========================================================
+                    // 1. Search Source 2 Candidates
+                    // ========================================================
                     if (!s1.root_name.empty()) {
-                        auto it = target_index.exact_name_map.find(s1.root_name);
-                        if (it != target_index.exact_name_map.end()) {
+                        auto it = target_index.exact_name_map_s2.find(s1.root_name);
+                        if (it != target_index.exact_name_map_s2.end()) {
                             for (uint32_t tid : it->second) {
-                                if (overlap_counts[tid] == 0) {
-                                    touched.push_back(tid);
-                                }
-                                overlap_counts[tid] = 9999; // Marked as exact match
+                                if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
+                                overlap_counts[tid] = 9999;
                             }
                         }
                     }
-
-                    // 2. Acronym matches
                     if (!s1.acronym.empty()) {
-                        auto it = target_index.exact_name_map.find(s1.acronym);
-                        if (it != target_index.exact_name_map.end()) {
+                        auto it = target_index.exact_name_map_s2.find(s1.acronym);
+                        if (it != target_index.exact_name_map_s2.end()) {
                             for (uint32_t tid : it->second) {
-                                if (overlap_counts[tid] == 0) {
-                                    touched.push_back(tid);
-                                    overlap_counts[tid] = 9998; // Marked as acronym match
-                                }
+                                if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
+                                overlap_counts[tid] = 9998;
                             }
                         }
                     }
-
-                    // 3. Token overlap matches
                     for (const auto& tok : s1.tokens) {
-                        auto it = target_index.token_inverted_index.find(tok);
-                        if (it != target_index.token_inverted_index.end()) {
+                        auto it = target_index.token_inverted_index_s2.find(tok);
+                        if (it != target_index.token_inverted_index_s2.end()) {
                             for (uint32_t tid : it->second) {
                                 if (overlap_counts[tid] == 0) {
-                                    touched.push_back(tid);
+                                    touched_s2.push_back(tid);
                                     overlap_counts[tid] = 1;
                                 } else if (overlap_counts[tid] > 0 && overlap_counts[tid] < 9900) {
                                     overlap_counts[tid]++;
@@ -743,8 +770,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         }
                     }
 
-                    // Score candidates
-                    for (uint32_t tid : touched) {
+                    // Score S2 Candidates
+                    for (uint32_t tid : touched_s2) {
                         int overlap = overlap_counts[tid];
                         const auto& target = target_index.records[tid];
 
@@ -756,7 +783,6 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         } else {
                             size_t union_size = s1.tokens.size() + target.tokens.size() - overlap;
                             double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
-                            
                             double jw = 0.0;
                             if (jaccard >= 0.20 || overlap >= 1) {
                                 jw = fast_jaro_winkler(s1.root_name.c_str(), target.root_name.c_str());
@@ -764,8 +790,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             base_name = std::max(jaccard, jw);
                         }
 
-                        // Street number agreement / contradiction
-                        int sn_agree = 0; // +1 match, -1 conflict, 0 missing
+                        int sn_agree = 0;
                         if (!s1.street_nums.empty() && !target.street_nums.empty()) {
                             bool has_match = false;
                             for (const auto& s1_sn : s1.street_nums) {
@@ -777,65 +802,253 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             sn_agree = has_match ? 1 : -1;
                         }
 
-                        // Postal code agreement / contradiction
-                        int postal_agree = 0; // +1 match, -1 conflict, 0 missing
+                        int postal_agree = 0;
                         if (!s1.postal_code.empty() && !target.postal_code.empty()) {
                             postal_agree = (s1.postal_code == target.postal_code) ? 1 : -1;
                         }
 
-                        // Composite calibrated score
                         double score = base_name;
-                        if (postal_agree == 1) {
-                            score += rules.postal_bonus;
-                        } else if (postal_agree == -1) {
-                            score -= 0.15;
-                        }
+                        if (postal_agree == 1) score += rules.postal_bonus;
+                        else if (postal_agree == -1) score -= 0.15;
 
-                        if (sn_agree == 1) {
-                            score += rules.street_num_bonus;
-                        } else if (sn_agree == -1) {
-                            score += rules.street_num_penalty;
-                        }
+                        if (sn_agree == 1) score += rules.street_num_bonus;
+                        else if (sn_agree == -1) score += rules.street_num_penalty;
 
-                        // Guard against chain stores: if both street numbers and postal codes conflict, severe penalty
-                        if (postal_agree == -1 && sn_agree == -1) {
-                            score -= 0.25;
-                        }
-
+                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
                         score = std::max(0.0, std::min(1.0, score));
 
                         if (score >= rules.min_candidate_score) {
-                            cand_scores.emplace_back(tid, score);
+                            s2_scores.emplace_back(tid, score);
                         }
                     }
 
-                    // Reset touched in scratch buffer
-                    for (uint32_t tid : touched) {
-                        overlap_counts[tid] = 0;
+                    // Reset touched S2 in scratch buffer
+                    for (uint32_t tid : touched_s2) overlap_counts[tid] = 0;
+
+                    // ========================================================
+                    // 2. Search Source 3 Candidates
+                    // ========================================================
+                    if (!s1.root_name.empty()) {
+                        auto it = target_index.exact_name_map_s3.find(s1.root_name);
+                        if (it != target_index.exact_name_map_s3.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
+                                overlap_counts[tid] = 9999;
+                            }
+                        }
+                    }
+                    if (!s1.acronym.empty()) {
+                        auto it = target_index.exact_name_map_s3.find(s1.acronym);
+                        if (it != target_index.exact_name_map_s3.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) touched_s3.push_back(tid);
+                                overlap_counts[tid] = 9998;
+                            }
+                        }
+                    }
+                    for (const auto& tok : s1.tokens) {
+                        auto it = target_index.token_inverted_index_s3.find(tok);
+                        if (it != target_index.token_inverted_index_s3.end()) {
+                            for (uint32_t tid : it->second) {
+                                if (overlap_counts[tid] == 0) {
+                                    touched_s3.push_back(tid);
+                                    overlap_counts[tid] = 1;
+                                } else if (overlap_counts[tid] > 0 && overlap_counts[tid] < 9900) {
+                                    overlap_counts[tid]++;
+                                }
+                            }
+                        }
                     }
 
-                    // Rank candidates
-                    if (!cand_scores.empty()) {
-                        std::sort(cand_scores.begin(), cand_scores.end(), [](const auto& a, const auto& b) {
-                            return a.second > b.second;
-                        });
+                    // Score S3 Candidates
+                    for (uint32_t tid : touched_s3) {
+                        int overlap = overlap_counts[tid];
+                        const auto& target = target_index.records[tid];
 
-                        std::vector<std::string> cands;
-                        std::vector<std::string> matches;
-                        size_t limit = std::min(rules.max_candidates_per_entity, cand_scores.size());
-                        cands.reserve(limit);
+                        double base_name = 0.0;
+                        if (overlap >= 9999 || (!s1.root_name.empty() && s1.root_name == target.root_name)) {
+                            base_name = 1.0;
+                        } else if (overlap == 9998 || (!s1.acronym.empty() && s1.acronym == target.root_name) || (!target.acronym.empty() && target.acronym == s1.root_name)) {
+                            base_name = 0.88;
+                        } else {
+                            size_t union_size = s1.tokens.size() + target.tokens.size() - overlap;
+                            double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
+                            double jw = 0.0;
+                            if (jaccard >= 0.20 || overlap >= 1) {
+                                jw = fast_jaro_winkler(s1.root_name.c_str(), target.root_name.c_str());
+                            }
+                            base_name = std::max(jaccard, jw);
+                        }
 
-                        for (size_t r = 0; r < limit; ++r) {
-                            const std::string& tid_str = target_index.records[cand_scores[r].first].id;
-                            cands.push_back(tid_str);
-                            if (cand_scores[r].second >= rules.match_threshold) {
-                                matches.push_back(tid_str);
+                        int sn_agree = 0;
+                        if (!s1.street_nums.empty() && !target.street_nums.empty()) {
+                            bool has_match = false;
+                            for (const auto& s1_sn : s1.street_nums) {
+                                for (const auto& t_sn : target.street_nums) {
+                                    if (s1_sn == t_sn) { has_match = true; break; }
+                                }
+                                if (has_match) break;
+                            }
+                            sn_agree = has_match ? 1 : -1;
+                        }
+
+                        int postal_agree = 0;
+                        if (!s1.postal_code.empty() && !target.postal_code.empty()) {
+                            postal_agree = (s1.postal_code == target.postal_code) ? 1 : -1;
+                        }
+
+                        double score = base_name;
+                        if (postal_agree == 1) score += rules.postal_bonus;
+                        else if (postal_agree == -1) score -= 0.15;
+
+                        if (sn_agree == 1) score += rules.street_num_bonus;
+                        else if (sn_agree == -1) score += rules.street_num_penalty;
+
+                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
+                        score = std::max(0.0, std::min(1.0, score));
+
+                        if (score >= rules.min_candidate_score) {
+                            s3_scores.emplace_back(tid, score);
+                        }
+                    }
+
+                    // Reset touched S3 in scratch buffer
+                    for (uint32_t tid : touched_s3) overlap_counts[tid] = 0;
+
+                    // Sort initial S2 and S3 candidates
+                    std::sort(s2_scores.begin(), s2_scores.end(), [](const auto& a, const auto& b) {
+                        return a.second > b.second;
+                    });
+                    std::sort(s3_scores.begin(), s3_scores.end(), [](const auto& a, const auto& b) {
+                        return a.second > b.second;
+                    });
+
+                    // ========================================================
+                    // 3. Tripartite Cross-Verification & Transitive Candidate Expansion
+                    //    (S1 <-> S2, S2 <-> S3, S1 <-> S3)
+                    // ========================================================
+                    if (!s2_scores.empty() && s2_scores[0].second >= 0.70) {
+                        const auto& top_s2 = target_index.records[s2_scores[0].first];
+                        
+                        // Transitive candidate discovery from S2 to S3
+                        if (!top_s2.root_name.empty()) {
+                            auto it = target_index.exact_name_map_s3.find(top_s2.root_name);
+                            if (it != target_index.exact_name_map_s3.end()) {
+                                for (uint32_t tid : it->second) {
+                                    bool exists = false;
+                                    for (const auto& p : s3_scores) {
+                                        if (p.first == tid) { exists = true; break; }
+                                    }
+                                    if (!exists) {
+                                        const auto& s3_rec = target_index.records[tid];
+                                        double jw = fast_jaro_winkler(s1.root_name.c_str(), s3_rec.root_name.c_str());
+                                        double trans_score = std::max(0.75, jw);
+                                        if (!top_s2.postal_code.empty() && !s3_rec.postal_code.empty() && top_s2.postal_code == s3_rec.postal_code) {
+                                            trans_score += 0.15;
+                                        }
+                                        trans_score = std::min(1.0, trans_score);
+                                        if (trans_score >= rules.min_candidate_score) {
+                                            s3_scores.emplace_back(tid, trans_score);
+                                        }
+                                    }
+                                }
                             }
                         }
 
-                        s1_candidates[s1_idx] = std::move(cands);
-                        s1_matches[s1_idx] = std::move(matches);
+                        // Tripartite mutual agreement boost for S3 candidates
+                        for (auto& s3_pair : s3_scores) {
+                            const auto& s3_rec = target_index.records[s3_pair.first];
+                            bool name_agree = (!top_s2.root_name.empty() && top_s2.root_name == s3_rec.root_name);
+                            bool postal_agree = (!top_s2.postal_code.empty() && !s3_rec.postal_code.empty() && top_s2.postal_code == s3_rec.postal_code);
+                            bool sn_agree = false;
+                            if (!top_s2.street_nums.empty() && !s3_rec.street_nums.empty()) {
+                                for (const auto& sn2 : top_s2.street_nums) {
+                                    for (const auto& sn3 : s3_rec.street_nums) {
+                                        if (sn2 == sn3) { sn_agree = true; break; }
+                                    }
+                                    if (sn_agree) break;
+                                }
+                            }
+                            if (name_agree || postal_agree || sn_agree) {
+                                s3_pair.second = std::min(1.0, s3_pair.second + 0.15); // Tripartite confirmation boost
+                            }
+                        }
+
+                        // Re-sort S3 scores after boost
+                        std::sort(s3_scores.begin(), s3_scores.end(), [](const auto& a, const auto& b) {
+                            return a.second > b.second;
+                        });
                     }
+
+                    // Transitive expansion from S3 to S2 if S3 had a high-confidence match
+                    if (!s3_scores.empty() && s3_scores[0].second >= 0.70) {
+                        const auto& top_s3 = target_index.records[s3_scores[0].first];
+                        if (!top_s3.root_name.empty()) {
+                            auto it = target_index.exact_name_map_s2.find(top_s3.root_name);
+                            if (it != target_index.exact_name_map_s2.end()) {
+                                for (uint32_t tid : it->second) {
+                                    bool exists = false;
+                                    for (const auto& p : s2_scores) {
+                                        if (p.first == tid) { exists = true; break; }
+                                    }
+                                    if (!exists) {
+                                        const auto& s2_rec = target_index.records[tid];
+                                        double jw = fast_jaro_winkler(s1.root_name.c_str(), s2_rec.root_name.c_str());
+                                        double trans_score = std::max(0.75, jw);
+                                        if (!top_s3.postal_code.empty() && !s2_rec.postal_code.empty() && top_s3.postal_code == s2_rec.postal_code) {
+                                            trans_score += 0.15;
+                                        }
+                                        trans_score = std::min(1.0, trans_score);
+                                        if (trans_score >= rules.min_candidate_score) {
+                                            s2_scores.emplace_back(tid, trans_score);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        std::sort(s2_scores.begin(), s2_scores.end(), [](const auto& a, const auto& b) {
+                            return a.second > b.second;
+                        });
+                    }
+
+                    // ========================================================
+                    // 4. Balanced Selection (Top S2 + Top S3)
+                    // ========================================================
+                    size_t s2_cap = rules.max_candidates_per_entity / 2;
+                    size_t s3_cap = rules.max_candidates_per_entity - s2_cap;
+
+                    size_t s2_take = std::min(s2_cap, s2_scores.size());
+                    size_t s3_take = std::min(s3_cap, s3_scores.size());
+
+                    if (s2_take < s2_cap) {
+                        s3_take = std::min(s3_scores.size(), rules.max_candidates_per_entity - s2_take);
+                    } else if (s3_take < s3_cap) {
+                        s2_take = std::min(s2_scores.size(), rules.max_candidates_per_entity - s3_take);
+                    }
+
+                    std::vector<std::string> cands;
+                    std::vector<std::string> matches;
+                    cands.reserve(rules.max_candidates_per_entity);
+                    matches.reserve(rules.max_candidates_per_entity);
+
+                    for (size_t i = 0; i < s2_take; ++i) {
+                        const std::string& tid_str = target_index.records[s2_scores[i].first].id;
+                        cands.push_back(tid_str);
+                        if (s2_scores[i].second >= rules.match_threshold) {
+                            matches.push_back(tid_str);
+                        }
+                    }
+
+                    for (size_t i = 0; i < s3_take; ++i) {
+                        const std::string& tid_str = target_index.records[s3_scores[i].first].id;
+                        cands.push_back(tid_str);
+                        if (s3_scores[i].second >= rules.match_threshold) {
+                            matches.push_back(tid_str);
+                        }
+                    }
+
+                    s1_candidates[s1_idx] = std::move(cands);
+                    s1_matches[s1_idx] = std::move(matches);
                 }
             });
         }

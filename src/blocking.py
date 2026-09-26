@@ -329,8 +329,22 @@ class CountryPartitionedBlocker:
         final_candidate_dict: Dict[str, List[str]] = {}
         pairs_list: List[Dict[str, str]] = []
 
+        half_cap = max(10, self.config.max_candidates_per_entity // 2)
         for s1_id, cand_set in all_candidates.items():
-            capped_cands = sorted(list(cand_set))[:self.config.max_candidates_per_entity]
+            s2_cands = [c for c in cand_set if c.startswith("S2-") or c.startswith("s2-")]
+            s3_cands = [c for c in cand_set if c.startswith("S3-") or c.startswith("s3-")]
+
+            selected_s2 = s2_cands[:half_cap]
+            selected_s3 = s3_cands[:half_cap]
+
+            remaining = self.config.max_candidates_per_entity - (len(selected_s2) + len(selected_s3))
+            if remaining > 0:
+                if len(s2_cands) > len(selected_s2):
+                    selected_s2.extend(s2_cands[half_cap:half_cap + remaining])
+                elif len(s3_cands) > len(selected_s3):
+                    selected_s3.extend(s3_cands[half_cap:half_cap + remaining])
+
+            capped_cands = selected_s2 + selected_s3
             final_candidate_dict[s1_id] = capped_cands
             for cand_id in capped_cands:
                 pairs_list.append({
