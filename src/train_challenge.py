@@ -184,25 +184,55 @@ def run_training_and_validation(
     val_X, _ = PairFeatureExtractor.build_feature_matrix(val_c_df, val_s1_p, target_p)
     val_probs = matcher.predict_proba(val_X)
 
-    # Graph resolution
+    # Graph resolution setup
     resolver = TripartiteGraphResolver(DEFAULT_CONFIG.resolver)
-    val_matches = resolver.resolve(
-        candidate_pairs_df=val_c_df,
-        probabilities=val_probs,
-        threshold=opt_threshold,
-        target_df=target_p
+    val_gt = {s1_id: gt_map.get(s1_id, set()) for s1_id in val_s1_ids}
+    val_true_singletons = sum(1 for s in val_gt.values() if not s)
+    val_true_singleton_rate = (val_true_singletons / max(1, len(val_gt))) * 100.0
+
+    # Systematically sweep candidate thresholds [0.30, 0.90] to maximize entity-level Macro-F0.5
+    logger.info("Sweeping decision thresholds [0.30 - 0.90] against official entity-level Macro-F0.5 metric...")
+    threshold_candidates = np.arange(0.30, 0.92, 0.02)
+    best_thresh = opt_threshold
+    best_macro_f05 = -1.0
+    best_matches = {}
+    best_per_entity_scores = {}
+
+    for thresh in threshold_candidates:
+        t_val = round(float(thresh), 3)
+        matches = resolver.resolve(
+            candidate_pairs_df=val_c_df,
+            probabilities=val_probs,
+            threshold=t_val,
+            target_df=target_p
+        )
+        pred_sets = {s1_id: set(matches.get(s1_id, [])) for s1_id in val_s1_ids}
+        score, per_entity = compute_macro_f05(val_gt, pred_sets, beta=0.5)
+
+        if score > best_macro_f05:
+            best_macro_f05 = score
+            best_thresh = t_val
+            best_matches = matches
+            best_per_entity_scores = per_entity
+
+    logger.info(
+        "Threshold sweep complete! Winning Decision Threshold: %.3f | Max Validation Macro-F0.5: %.4f",
+        best_thresh, best_macro_f05
     )
 
-    # Compute official Macro-F0.5 metric on validation set
-    val_gt = {s1_id: gt_map.get(s1_id, set()) for s1_id in val_s1_ids}
+    val_matches = best_matches
+    opt_threshold = best_thresh
+    macro_f05 = best_macro_f05
+    per_entity_scores = best_per_entity_scores
     val_pred_sets = {s1_id: set(val_matches.get(s1_id, [])) for s1_id in val_s1_ids}
-
-    macro_f05, per_entity_scores = compute_macro_f05(val_gt, val_pred_sets, beta=0.5)
 
     # Detailed statistics
     val_singletons = [s1_id for s1_id in val_s1_ids if not val_gt[s1_id]]
     singleton_scores = [per_entity_scores[s1_id] for s1_id in val_singletons]
     singleton_accuracy = (sum(singleton_scores) / max(1, len(singleton_scores))) * 100
+
+    pred_singletons_count = sum(1 for s in val_pred_sets.values() if not s)
+    pred_singleton_rate = (pred_singletons_count / max(1, len(val_s1_ids))) * 100.0
 
     val_non_singletons = [s1_id for s1_id in val_s1_ids if val_gt[s1_id]]
     non_singleton_scores = [per_entity_scores[s1_id] for s1_id in val_non_singletons]
@@ -211,10 +241,24 @@ def run_training_and_validation(
     logger.info("=" * 70)
     logger.info("VALIDATION RESULTS SUMMARY ON REAL CHALLENGE DATA:")
     logger.info("  Total Validation Entities: %d", len(val_s1_ids))
+    logger.info("  Winning Threshold:        %.3f", opt_threshold)
     logger.info("  Macro-F0.5 Score:         %.4f (Target >= 0.9333)", macro_f05)
     logger.info("  Singleton Accuracy:       %.2f%% (%d singletons)", singleton_accuracy, len(val_singletons))
+    logger.info("  Predicted Singleton Rate: %.2f%% (Ground Truth Rate: %.2f%%)", pred_singleton_rate, val_true_singleton_rate)
     logger.info("  Non-Singleton Mean F0.5:  %.4f (%d entities)", non_singleton_mean, len(val_non_singletons))
     logger.info("=" * 70)
+
+    # Save winning threshold config artifact
+    config_path = DEFAULT_CONFIG.paths.threshold_config_file
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "optimal_threshold": opt_threshold,
+            "macro_f05_val": macro_f05,
+            "macro_f05_cv": cv_f05,
+            "singleton_rate": pred_singleton_rate,
+            "true_singleton_rate": val_true_singleton_rate,
+            "beta": 0.5
+        }, f, indent=2)
 
     # Print 5 sample accuracy matches
     print("\nSAMPLE ACCURACY MATCHES FROM VALIDATION SET:")

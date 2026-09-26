@@ -28,14 +28,60 @@
 
 namespace {
 
-// Common high-frequency stopwords to avoid bloated inverted indexes
+// Purely grammatical noise stopwords (never strip business terms like group, holdings, solutions, mines, foods, or cities)
 static const std::unordered_set<std::string> STOPWORDS = {
-    "and", "the", "for", "with", "ltd", "inc", "corp", "llc", "pvt", "limited",
-    "private", "company", "co", "services", "enterprises", "solutions", "group",
-    "india", "france", "usa", "delhi", "mumbai", "paris", "bordeaux", "new",
-    "trading", "holdings", "international", "de", "la", "le", "des", "du", "sa",
-    "sas", "sarl", "eurl", "snc"
+    "and", "the", "for", "with", "of", "in", "at", "by", "from", "de", "la", "le", "des", "du", "et", "d"
 };
+
+// Address noise stopwords that appear universally in addresses
+static const std::unordered_set<std::string> ADDRESS_STOPWORDS = {
+    "street", "st", "road", "rd", "avenue", "ave", "drive", "dr", "lane", "ln",
+    "way", "blvd", "boulevard", "floor", "fl", "unit", "apt", "apartment",
+    "suite", "ste", "building", "bldg", "near", "opp", "opposite", "behind",
+    "beside", "dist", "district", "post", "po", "box", "nagar", "colony", "marg",
+    "sector", "sec", "phase", "rue", "place", "allee", "zone",
+    "block", "blk", "plot", "no", "shop", "flat"
+};
+
+// Fast 32-bit FNV-1a hash
+inline uint32_t fnv1a_32(std::string_view s) {
+    uint32_t hash = 2166136261u;
+    for (char c : s) {
+        hash ^= (uint8_t)c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+// Extract locality & street name hashes from address
+std::vector<uint32_t> extract_address_token_hashes_cpp_internal(std::string_view clean_addr) {
+    std::vector<uint32_t> hashes;
+    hashes.reserve(8);
+    size_t i = 0;
+    while (i < clean_addr.size()) {
+        if (std::isalpha((unsigned char)clean_addr[i])) {
+            size_t start = i;
+            while (i < clean_addr.size() && std::isalpha((unsigned char)clean_addr[i])) {
+                i++;
+            }
+            std::string w(clean_addr.substr(start, i - start));
+            if (w.length() >= 3 && ADDRESS_STOPWORDS.find(w) == ADDRESS_STOPWORDS.end()) {
+                uint32_t h = fnv1a_32(w);
+                bool exists = false;
+                for (uint32_t eh : hashes) {
+                    if (eh == h) { exists = true; break; }
+                }
+                if (!exists) {
+                    hashes.push_back(h);
+                    if (hashes.size() >= 8) break;
+                }
+            }
+        } else {
+            i++;
+        }
+    }
+    return hashes;
+}
 
 struct LegalPattern {
     std::string pattern;
@@ -275,6 +321,7 @@ struct TargetRecord {
     std::vector<std::string> tokens;
     std::vector<std::string> street_nums;
     std::string postal_code;
+    std::vector<uint32_t> addr_hashes;
     uint8_t source_type; // 2 for Source 2, 3 for Source 3
 };
 
@@ -287,6 +334,7 @@ struct S1Record {
     std::vector<std::string> tokens;
     std::vector<std::string> street_nums;
     std::string postal_code;
+    std::vector<uint32_t> addr_hashes;
 };
 
 // Per-country target index with dedicated dual-source inverted maps (prevents S2 from starving S3)
@@ -300,18 +348,21 @@ struct CountryTargetIndex {
 
 // Resolution rules configuration
 struct ResolutionRules {
-    double match_threshold = 0.80;
+    double match_threshold = 0.55;
     double min_candidate_score = 0.35;
     double exact_name_score = 1.0;
     double street_num_bonus = 0.15;
-    double street_num_penalty = -0.25;
+    double street_num_penalty = -0.35;
     double postal_bonus = 0.15;
+    double postal_penalty = -0.35;
+    double addr_bonus = 0.15;
+    double addr_penalty = -0.35;
     double weight_name = 0.65;
     double weight_street = 0.20;
     double weight_postal = 0.15;
     size_t max_candidates_per_entity = 10; // Compact candidate set for final ranking boost
     size_t max_posting_list_size = 35;
-    size_t max_exact_posting_size = 25;
+    size_t max_exact_posting_size = 50;
     int num_threads = 8;
 };
 } // namespace
@@ -544,6 +595,9 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         parse_double("\"street_num_bonus\"", rules.street_num_bonus);
         parse_double("\"street_num_penalty\"", rules.street_num_penalty);
         parse_double("\"postal_bonus\"", rules.postal_bonus);
+        parse_double("\"postal_penalty\"", rules.postal_penalty);
+        parse_double("\"addr_bonus\"", rules.addr_bonus);
+        parse_double("\"addr_penalty\"", rules.addr_penalty);
         parse_int("\"num_threads\"", rules.num_threads);
         int max_cands = (int)rules.max_candidates_per_entity;
         parse_int("\"max_candidates_per_entity\"", max_cands);
@@ -591,11 +645,13 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         std::string country = normalize_country_cpp_internal(raw_country);
         std::string acronym = extract_acronym_cpp_internal(root_name);
         std::vector<std::string> tokens = extract_tokens_cpp_internal(root_name);
-        std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(raw_addr);
-        std::string postal = extract_postal_code_cpp_internal(raw_addr);
+        std::string clean_addr = normalize_text_cpp_internal(raw_addr);
+        std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(clean_addr);
+        std::string postal = extract_postal_code_cpp_internal(clean_addr);
+        std::vector<uint32_t> addr_hashes = extract_address_token_hashes_cpp_internal(clean_addr);
 
         size_t idx = s1_records.size();
-        s1_records.push_back({std::move(id), std::move(root_name), std::move(acronym), country, std::move(tokens), std::move(street_nums), std::move(postal)});
+        s1_records.push_back({std::move(id), std::move(root_name), std::move(acronym), country, std::move(tokens), std::move(street_nums), std::move(postal), std::move(addr_hashes)});
         s1_by_country[country].push_back(idx);
     }
     s1_file.close();
@@ -639,8 +695,10 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
             auto [root_name, _] = parse_legal_suffix_cpp_internal(clean_name);
             std::string acronym = extract_acronym_cpp_internal(root_name);
             std::vector<std::string> tokens = extract_tokens_cpp_internal(root_name);
-            std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(raw_addr);
-            std::string postal = extract_postal_code_cpp_internal(raw_addr);
+            std::string clean_addr = normalize_text_cpp_internal(raw_addr);
+            std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(clean_addr);
+            std::string postal = extract_postal_code_cpp_internal(clean_addr);
+            std::vector<uint32_t> addr_hashes = extract_address_token_hashes_cpp_internal(clean_addr);
 
             uint32_t rec_idx = (uint32_t)target_index.records.size();
 
@@ -688,7 +746,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                 }
             }
 
-            target_index.records.push_back({std::move(id), std::move(root_name), std::move(acronym), std::move(tokens), std::move(street_nums), std::move(postal), src_type});
+            target_index.records.push_back({std::move(id), std::move(root_name), std::move(acronym), std::move(tokens), std::move(street_nums), std::move(postal), std::move(addr_hashes), src_type});
         }
         tgt_file.close();
     }
@@ -770,30 +828,28 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         }
                     }
 
-                    // Score S2 Candidates
-                    for (uint32_t tid : touched_s2) {
-                        int overlap = overlap_counts[tid];
-                        const auto& target = target_index.records[tid];
-
+                    // Lambda for computing rich multi-field score between s1 and target
+                    auto compute_score = [&](const S1Record& s1_rec, const TargetRecord& target, int overlap) -> double {
                         double base_name = 0.0;
-                        if (overlap >= 9999 || (!s1.root_name.empty() && s1.root_name == target.root_name)) {
+                        if (overlap >= 9999 || (!s1_rec.root_name.empty() && s1_rec.root_name == target.root_name)) {
                             base_name = 1.0;
-                        } else if (overlap == 9998 || (!s1.acronym.empty() && s1.acronym == target.root_name) || (!target.acronym.empty() && target.acronym == s1.root_name)) {
+                        } else if (overlap == 9998 || (!s1_rec.acronym.empty() && s1_rec.acronym == target.root_name) || (!target.acronym.empty() && target.acronym == s1_rec.root_name)) {
                             base_name = 0.88;
                         } else {
-                            size_t union_size = s1.tokens.size() + target.tokens.size() - overlap;
+                            size_t union_size = s1_rec.tokens.size() + target.tokens.size() - overlap;
                             double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
                             double jw = 0.0;
                             if (jaccard >= 0.20 || overlap >= 1) {
-                                jw = fast_jaro_winkler(s1.root_name.c_str(), target.root_name.c_str());
+                                jw = fast_jaro_winkler(s1_rec.root_name.c_str(), target.root_name.c_str());
                             }
                             base_name = std::max(jaccard, jw);
                         }
 
+                        // Numeric Street Number Check
                         int sn_agree = 0;
-                        if (!s1.street_nums.empty() && !target.street_nums.empty()) {
+                        if (!s1_rec.street_nums.empty() && !target.street_nums.empty()) {
                             bool has_match = false;
-                            for (const auto& s1_sn : s1.street_nums) {
+                            for (const auto& s1_sn : s1_rec.street_nums) {
                                 for (const auto& t_sn : target.street_nums) {
                                     if (s1_sn == t_sn) { has_match = true; break; }
                                 }
@@ -802,21 +858,53 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             sn_agree = has_match ? 1 : -1;
                         }
 
+                        // Postal Code Check
                         int postal_agree = 0;
-                        if (!s1.postal_code.empty() && !target.postal_code.empty()) {
-                            postal_agree = (s1.postal_code == target.postal_code) ? 1 : -1;
+                        if (!s1_rec.postal_code.empty() && !target.postal_code.empty()) {
+                            postal_agree = (s1_rec.postal_code == target.postal_code) ? 1 : -1;
                         }
 
+                        // Address / Locality Token Check
+                        int addr_overlap = 0;
+                        if (!s1_rec.addr_hashes.empty() && !target.addr_hashes.empty()) {
+                            for (uint32_t h1 : s1_rec.addr_hashes) {
+                                for (uint32_t h2 : target.addr_hashes) {
+                                    if (h1 == h2) { addr_overlap++; break; }
+                                }
+                            }
+                        }
+
+                        int addr_agree = 0;
+                        if (s1_rec.addr_hashes.size() >= 2 && target.addr_hashes.size() >= 2) {
+                            addr_agree = (addr_overlap >= 1) ? 1 : -1;
+                        } else if (addr_overlap >= 1) {
+                            addr_agree = 1;
+                        }
+
+                        // Composite Discriminator Score with Singleton Protections
                         double score = base_name;
                         if (postal_agree == 1) score += rules.postal_bonus;
-                        else if (postal_agree == -1) score -= 0.15;
+                        else if (postal_agree == -1) score += rules.postal_penalty;
 
                         if (sn_agree == 1) score += rules.street_num_bonus;
                         else if (sn_agree == -1) score += rules.street_num_penalty;
 
-                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
-                        score = std::max(0.0, std::min(1.0, score));
+                        if (addr_agree == 1) score += rules.addr_bonus;
+                        else if (addr_agree == -1) score += rules.addr_penalty;
 
+                        // Hard penalties for compound contradictions (prevents spurious singleton matches)
+                        if (postal_agree == -1 && addr_agree == -1) score -= 0.25;
+                        if (sn_agree == -1 && addr_agree == -1) score -= 0.25;
+                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
+
+                        return std::max(0.0, std::min(1.0, score));
+                    };
+
+                    // Score S2 Candidates
+                    for (uint32_t tid : touched_s2) {
+                        int overlap = overlap_counts[tid];
+                        const auto& target = target_index.records[tid];
+                        double score = compute_score(s1, target, overlap);
                         if (score >= rules.min_candidate_score) {
                             s2_scores.emplace_back(tid, score);
                         }
@@ -864,49 +952,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     for (uint32_t tid : touched_s3) {
                         int overlap = overlap_counts[tid];
                         const auto& target = target_index.records[tid];
-
-                        double base_name = 0.0;
-                        if (overlap >= 9999 || (!s1.root_name.empty() && s1.root_name == target.root_name)) {
-                            base_name = 1.0;
-                        } else if (overlap == 9998 || (!s1.acronym.empty() && s1.acronym == target.root_name) || (!target.acronym.empty() && target.acronym == s1.root_name)) {
-                            base_name = 0.88;
-                        } else {
-                            size_t union_size = s1.tokens.size() + target.tokens.size() - overlap;
-                            double jaccard = (union_size > 0) ? ((double)overlap / (double)union_size) : 0.0;
-                            double jw = 0.0;
-                            if (jaccard >= 0.20 || overlap >= 1) {
-                                jw = fast_jaro_winkler(s1.root_name.c_str(), target.root_name.c_str());
-                            }
-                            base_name = std::max(jaccard, jw);
-                        }
-
-                        int sn_agree = 0;
-                        if (!s1.street_nums.empty() && !target.street_nums.empty()) {
-                            bool has_match = false;
-                            for (const auto& s1_sn : s1.street_nums) {
-                                for (const auto& t_sn : target.street_nums) {
-                                    if (s1_sn == t_sn) { has_match = true; break; }
-                                }
-                                if (has_match) break;
-                            }
-                            sn_agree = has_match ? 1 : -1;
-                        }
-
-                        int postal_agree = 0;
-                        if (!s1.postal_code.empty() && !target.postal_code.empty()) {
-                            postal_agree = (s1.postal_code == target.postal_code) ? 1 : -1;
-                        }
-
-                        double score = base_name;
-                        if (postal_agree == 1) score += rules.postal_bonus;
-                        else if (postal_agree == -1) score -= 0.15;
-
-                        if (sn_agree == 1) score += rules.street_num_bonus;
-                        else if (sn_agree == -1) score += rules.street_num_penalty;
-
-                        if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
-                        score = std::max(0.0, std::min(1.0, score));
-
+                        double score = compute_score(s1, target, overlap);
                         if (score >= rules.min_candidate_score) {
                             s3_scores.emplace_back(tid, score);
                         }
@@ -941,12 +987,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     }
                                     if (!exists) {
                                         const auto& s3_rec = target_index.records[tid];
-                                        double jw = fast_jaro_winkler(s1.root_name.c_str(), s3_rec.root_name.c_str());
-                                        double trans_score = std::max(0.75, jw);
-                                        if (!top_s2.postal_code.empty() && !s3_rec.postal_code.empty() && top_s2.postal_code == s3_rec.postal_code) {
-                                            trans_score += 0.15;
-                                        }
-                                        trans_score = std::min(1.0, trans_score);
+                                        double trans_score = compute_score(s1, s3_rec, 9999);
                                         if (trans_score >= rules.min_candidate_score) {
                                             s3_scores.emplace_back(tid, trans_score);
                                         }
@@ -993,12 +1034,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     }
                                     if (!exists) {
                                         const auto& s2_rec = target_index.records[tid];
-                                        double jw = fast_jaro_winkler(s1.root_name.c_str(), s2_rec.root_name.c_str());
-                                        double trans_score = std::max(0.75, jw);
-                                        if (!top_s3.postal_code.empty() && !s2_rec.postal_code.empty() && top_s3.postal_code == s2_rec.postal_code) {
-                                            trans_score += 0.15;
-                                        }
-                                        trans_score = std::min(1.0, trans_score);
+                                        double trans_score = compute_score(s1, s2_rec, 9999);
                                         if (trans_score >= rules.min_candidate_score) {
                                             s2_scores.emplace_back(tid, trans_score);
                                         }
@@ -1006,6 +1042,26 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                 }
                             }
                         }
+
+                        // Tripartite mutual agreement boost for S2 candidates
+                        for (auto& s2_pair : s2_scores) {
+                            const auto& s2_rec = target_index.records[s2_pair.first];
+                            bool name_agree = (!top_s3.root_name.empty() && top_s3.root_name == s2_rec.root_name);
+                            bool postal_agree = (!top_s3.postal_code.empty() && !s2_rec.postal_code.empty() && top_s3.postal_code == s2_rec.postal_code);
+                            bool sn_agree = false;
+                            if (!top_s3.street_nums.empty() && !s2_rec.street_nums.empty()) {
+                                for (const auto& sn3 : top_s3.street_nums) {
+                                    for (const auto& sn2 : s2_rec.street_nums) {
+                                        if (sn3 == sn2) { sn_agree = true; break; }
+                                    }
+                                    if (sn_agree) break;
+                                }
+                            }
+                            if (name_agree && (postal_agree || sn_agree)) {
+                                s2_pair.second = std::min(1.0, s2_pair.second + 0.15); // Tripartite confirmation boost
+                            }
+                        }
+
                         std::sort(s2_scores.begin(), s2_scores.end(), [](const auto& a, const auto& b) {
                             return a.second > b.second;
                         });
@@ -1151,8 +1207,10 @@ EXPORT_API const char* query_entity_resolution_cpp(
     auto [root_name, _] = parse_legal_suffix_cpp_internal(clean_name);
     std::string country = normalize_country_cpp_internal(raw_country ? raw_country : "UNKNOWN");
     std::vector<std::string> tokens = extract_tokens_cpp_internal(root_name);
-    std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(raw_addr ? raw_addr : "");
-    std::string postal = extract_postal_code_cpp_internal(raw_addr ? raw_addr : "");
+    std::string clean_addr = normalize_text_cpp_internal(raw_addr ? raw_addr : "");
+    std::vector<std::string> street_nums = extract_street_numbers_cpp_internal(clean_addr);
+    std::string postal = extract_postal_code_cpp_internal(clean_addr);
+    std::vector<uint32_t> addr_hashes = extract_address_token_hashes_cpp_internal(clean_addr);
 
     std::unordered_set<std::string> s1_tok_set(tokens.begin(), tokens.end());
     std::unordered_set<std::string> s1_snum_set(street_nums.begin(), street_nums.end());
@@ -1183,8 +1241,50 @@ EXPORT_API const char* query_entity_resolution_cpp(
             auto [t_root, _t_leg] = parse_legal_suffix_cpp_internal(t_clean);
 
             double score = 0.0;
+            std::string t_clean_addr = normalize_text_cpp_internal(t_addr);
+            std::vector<std::string> t_snums = extract_street_numbers_cpp_internal(t_clean_addr);
+            std::string t_postal = extract_postal_code_cpp_internal(t_clean_addr);
+            std::vector<uint32_t> t_addr_hashes = extract_address_token_hashes_cpp_internal(t_clean_addr);
+
+            int sn_agree = 0;
+            if (!s1_snum_set.empty() && !t_snums.empty()) {
+                bool matched = false;
+                for (const auto& ts : t_snums) {
+                    if (s1_snum_set.find(ts) != s1_snum_set.end()) { matched = true; break; }
+                }
+                sn_agree = matched ? 1 : -1;
+            }
+
+            int postal_agree = 0;
+            if (!postal.empty() && !t_postal.empty()) {
+                postal_agree = (postal == t_postal) ? 1 : -1;
+            }
+
+            int addr_overlap = 0;
+            if (!addr_hashes.empty() && !t_addr_hashes.empty()) {
+                for (uint32_t h1 : addr_hashes) {
+                    for (uint32_t h2 : t_addr_hashes) {
+                        if (h1 == h2) { addr_overlap++; break; }
+                    }
+                }
+            }
+            int addr_agree = 0;
+            if (addr_hashes.size() >= 2 && t_addr_hashes.size() >= 2) {
+                addr_agree = (addr_overlap >= 1) ? 1 : -1;
+            } else if (addr_overlap >= 1) {
+                addr_agree = 1;
+            }
+
             if (!root_name.empty() && root_name == t_root) {
                 score = 1.0;
+                if (postal_agree == 1) score += 0.15;
+                else if (postal_agree == -1) score -= 0.35;
+                if (sn_agree == 1) score += 0.15;
+                else if (sn_agree == -1) score -= 0.35;
+                if (addr_agree == 1) score += 0.15;
+                else if (addr_agree == -1) score -= 0.35;
+                if (postal_agree == -1 && addr_agree == -1) score -= 0.25;
+                score = std::max(0.0, std::min(1.0, score));
             } else {
                 std::string t_acronym = extract_acronym_cpp_internal(t_root);
                 std::string s1_acronym = extract_acronym_cpp_internal(root_name);
@@ -1204,29 +1304,18 @@ EXPORT_API const char* query_entity_resolution_cpp(
                     double jw = fast_jaro_winkler(root_name.c_str(), t_root.c_str());
                     double base_name = is_acronym_match ? 0.88 : std::max(jaccard, jw);
 
-                    int sn_agree = 0;
-                    std::vector<std::string> t_snums = extract_street_numbers_cpp_internal(t_addr);
-                    if (!s1_snum_set.empty() && !t_snums.empty()) {
-                        bool matched = false;
-                        for (const auto& ts : t_snums) {
-                            if (s1_snum_set.find(ts) != s1_snum_set.end()) { matched = true; break; }
-                        }
-                        sn_agree = matched ? 1 : -1;
-                    }
-
-                    std::string t_postal = extract_postal_code_cpp_internal(t_addr);
-                    int postal_agree = 0;
-                    if (!postal.empty() && !t_postal.empty()) {
-                        postal_agree = (postal == t_postal) ? 1 : -1;
-                    }
-
                     score = base_name;
                     if (postal_agree == 1) score += 0.15;
-                    else if (postal_agree == -1) score -= 0.15;
+                    else if (postal_agree == -1) score -= 0.35;
 
                     if (sn_agree == 1) score += 0.15;
-                    else if (sn_agree == -1) score -= 0.25;
+                    else if (sn_agree == -1) score -= 0.35;
 
+                    if (addr_agree == 1) score += 0.15;
+                    else if (addr_agree == -1) score -= 0.35;
+
+                    if (postal_agree == -1 && addr_agree == -1) score -= 0.25;
+                    if (sn_agree == -1 && addr_agree == -1) score -= 0.25;
                     if (postal_agree == -1 && sn_agree == -1) score -= 0.25;
                     score = std::max(0.0, std::min(1.0, score));
                 }

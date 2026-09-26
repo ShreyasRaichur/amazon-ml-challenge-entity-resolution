@@ -178,9 +178,13 @@ class CPPEngine:
         rules_dict = {
             "match_threshold": 0.55,
             "min_candidate_score": 0.35,
-            "street_num_bonus": 0.25,
-            "street_num_penalty": -0.50,
+            "street_num_bonus": 0.15,
+            "street_num_penalty": -0.35,
             "postal_bonus": 0.15,
+            "postal_penalty": -0.35,
+            "addr_bonus": 0.15,
+            "addr_penalty": -0.35,
+            "max_candidates_per_entity": 10,
             "num_threads": 8
         }
         if rules:

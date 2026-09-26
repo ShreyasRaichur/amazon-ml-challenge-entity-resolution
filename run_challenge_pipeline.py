@@ -153,13 +153,16 @@ def main() -> None:
             optimal_threshold = float(cfg.get("optimal_threshold", 0.55))
         logger.info("Using saved optimal threshold: %.3f", optimal_threshold)
 
-    # Save finalized execution config with high-precision threshold and compact candidates
+    # Save finalized execution config using data-driven tuned threshold and calibrated multi-field penalties
     exec_config = {
-        "match_threshold": round(max(0.80, optimal_threshold), 3),
+        "match_threshold": round(optimal_threshold, 3),
         "min_candidate_score": 0.35,
         "street_num_bonus": 0.15,
-        "street_num_penalty": -0.25,
+        "street_num_penalty": -0.35,
         "postal_bonus": 0.15,
+        "postal_penalty": -0.35,
+        "addr_bonus": 0.15,
+        "addr_penalty": -0.35,
         "max_candidates_per_entity": 10,
         "num_threads": args.threads
     }
@@ -224,13 +227,17 @@ def main() -> None:
         logger.warning("Validation script not found at %s. Skipping validation step.", val_script)
 
     total_time = time.time() - t_total_start
+    total_s1 = cpp_res.get('total_s1', 0)
+    singletons = cpp_res.get('singletons', 0)
+    singleton_pct = (singletons / max(1, total_s1)) * 100.0
+
     print_banner("PIPELINE COMPLETED SUCCESSFULLY")
     print(f"  Total Pipeline Time:        {total_time:.2f} seconds")
-    print(f"  Decision Threshold (F0.5):  {optimal_threshold:.3f}")
-    print(f"  Total S1 Records Scored:    {cpp_res.get('total_s1'):,}")
-    print(f"  Total Candidates Generated: {cpp_res.get('total_candidates'):,}")
-    print(f"  Total Matches Resolved:     {cpp_res.get('total_matches'):,}")
-    print(f"  Singletons (Empty Lists):   {cpp_res.get('singletons'):,}")
+    print(f"  Decision Threshold (F0.5):  {exec_config['match_threshold']:.3f}")
+    print(f"  Total S1 Records Scored:    {total_s1:,}")
+    print(f"  Total Candidates Generated: {cpp_res.get('total_candidates', 0):,}")
+    print(f"  Total Matches Resolved:     {cpp_res.get('total_matches', 0):,}")
+    print(f"  Singletons (Empty Lists):   {singletons:,} ({singleton_pct:.2f}% | Ground Truth target: ~5.80%)")
     print(f"  Matching Output File:       {match_file} ({match_file.stat().st_size / (1024*1024):.1f} MB)")
     print(f"  Candidate Output File:      {cand_file} ({cand_file.stat().st_size / (1024*1024):.1f} MB)")
     print("=" * 75 + "\n")
