@@ -116,7 +116,7 @@ class TrainConfig:
         "colsample_bytree": 0.85,
         "scale_pos_weight": 1.5,
         "random_state": 42,
-        "n_jobs": -1,
+        "n_jobs": 1,
         "verbose": -1,
     })
     # Target metric beta: F_0.5 gives precision 2x priority over recall

@@ -134,17 +134,15 @@ class TripartiteGraphResolver:
                 # Uncontested
                 accepted_assignments[claims[0][0]].add(cand_id)
             else:
-                # Contested: Winner is S1 entity with highest probability
+                # Contested: Assign to S1 entity with highest probability (argmax)
                 claims.sort(key=lambda x: x[1], reverse=True)
                 best_s1, best_prob = claims[0]
-                runner_up_s1, runner_up_prob = claims[1]
-                # If clear winner, assign to best S1
-                if best_prob - runner_up_prob >= 0.05:
-                    accepted_assignments[best_s1].add(cand_id)
-                else:
-                    # In case of near-tie, assign only if above conservative high threshold
-                    if best_prob >= threshold + 0.08:
-                        accepted_assignments[best_s1].add(cand_id)
+                accepted_assignments[best_s1].add(cand_id)
+                for runner_s1, r_prob in claims[1:]:
+                    logger.info(
+                        "[AUDIT CONTESTED DISCARD] Target %s: assigned to %s (prob=%.4f), unassigned from %s (prob=%.4f)",
+                        cand_id, best_s1, best_prob, runner_s1, r_prob
+                    )
 
         # 3. Tripartite Consistency Verification (Cross S2-S3 coherence)
         final_matches: Dict[str, List[str]] = {}
@@ -179,8 +177,16 @@ class TripartiteGraphResolver:
                             p3 = next((p for c, p in s1_candidates[s1_id] if c == s3_id), 0.0)
                             if p2 >= p3 and p3 < 0.65:
                                 valid_cands.discard(s3_id)
+                                logger.info(
+                                    "[AUDIT CROSS-TARGET DISCARD] Discarded candidate %s for entity %s due to cross-target contradiction with %s (consistency=%.2f, p2=%.4f, p3=%.4f)",
+                                    s3_id, s1_id, s2_id, consistency, p2, p3
+                                )
                             elif p3 > p2 and p2 < 0.65:
                                 valid_cands.discard(s2_id)
+                                logger.info(
+                                    "[AUDIT CROSS-TARGET DISCARD] Discarded candidate %s for entity %s due to cross-target contradiction with %s (consistency=%.2f, p2=%.4f, p3=%.4f)",
+                                    s2_id, s1_id, s3_id, consistency, p2, p3
+                                )
 
             # Ensure strict subset property
             valid_cands = valid_cands.intersection(candidate_sets[s1_id])

@@ -126,8 +126,8 @@ def save_tsv_mapping(
         writer.writerow([id_col, val_col])
         for s1_id in sorted(mapping.keys()):
             target_ids = mapping[s1_id]
-            # Comma-separated list of target entity IDs, or empty string
-            target_str = ",".join(target_ids) if target_ids else ""
+            sorted_targets = sorted(list(target_ids)) if target_ids else []
+            target_str = ",".join(sorted_targets) if sorted_targets else ""
             writer.writerow([s1_id, target_str])
 
 

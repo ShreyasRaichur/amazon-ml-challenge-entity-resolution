@@ -306,9 +306,9 @@ def run_full_test_inference_python(
         match_writer.writerow(["source1_entity_id", "matched_entity_ids"])
         cand_writer.writerow(["source1_entity_id", "candidate_entity_ids"])
 
-        for s1_id in s1_order:
-            cands = s1_candidates_map.get(s1_id, [])
-            matches = s1_matches_map.get(s1_id, [])
+        for s1_id in sorted(s1_order):
+            cands = sorted(s1_candidates_map.get(s1_id, []))
+            matches = sorted(s1_matches_map.get(s1_id, []))
 
             # Ensure strict subset property
             valid_matches = [m for m in matches if m in cands]

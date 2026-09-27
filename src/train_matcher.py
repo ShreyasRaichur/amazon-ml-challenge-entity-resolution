@@ -54,6 +54,9 @@ class MatcherModel:
             # Drop scikit-learn specific kwargs if any
             clean_params = {k: v for k, v in self.params.items() if k not in ["scale_pos_weight", "min_child_samples"]}
             scale_pos = self.params.get("scale_pos_weight", 1.0)
+            clean_params["n_jobs"] = 1
+            clean_params["num_threads"] = 1
+            clean_params["verbose"] = -1
             self.model = lgb.LGBMClassifier(
                 **clean_params,
                 min_child_samples=adaptive_min_samples,

@@ -19,6 +19,7 @@
 #include <mutex>
 #include <future>
 #include <chrono>
+#include <numeric>
 
 #if defined(_WIN32) || defined(_WIN64)
 #define EXPORT_API __declspec(dllexport)
@@ -383,8 +384,9 @@ EXPORT_API void parse_legal_suffix_cpp(const char* input, char* root_output, cha
     auto [root, legal] = parse_legal_suffix_cpp_internal(input);
     std::strncpy(root_output, root.c_str(), max_len - 1);
     root_output[max_len - 1] = '\0';
-    std::strncpy(legal_type_output, legal.c_str(), max_len - 1);
-    legal_type_output[max_len - 1] = '\0';
+    int legal_max = std::min(max_len, 256);
+    std::strncpy(legal_type_output, legal.c_str(), legal_max - 1);
+    legal_type_output[legal_max - 1] = '\0';
 }
 
 // Fast Levenshtein Distance
@@ -784,15 +786,6 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     // ========================================================
                     // 1. Search Source 2 Candidates
                     // ========================================================
-                    if (!s1.root_name.empty()) {
-                        auto it = target_index.exact_name_map_s2.find(s1.root_name);
-                        if (it != target_index.exact_name_map_s2.end()) {
-                            for (uint32_t tid : it->second) {
-                                if (overlap_counts[tid] == 0) touched_s2.push_back(tid);
-                                overlap_counts[tid] = 9999;
-                            }
-                        }
-                    }
                     // ========================================================
                     // 1. Search Source 2 Candidates
                     // ========================================================
@@ -840,7 +833,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
-                        // Numeric Street Number Check
+                        // Structured Numeric Street Number Check
                         int sn_agree = 0;
                         if (!s1_rec.street_nums.empty() && !target.street_nums.empty()) {
                             bool has_match = false;
@@ -853,13 +846,13 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             sn_agree = has_match ? 1 : -1;
                         }
 
-                        // Postal Code Check
+                        // Structured Postal Code Check
                         int postal_agree = 0;
                         if (!s1_rec.postal_code.empty() && !target.postal_code.empty()) {
                             postal_agree = (s1_rec.postal_code == target.postal_code) ? 1 : -1;
                         }
 
-                        // Address / Locality Token Check
+                        // Structured Address / Locality Token Check
                         int addr_agree = 0;
                         int addr_overlap = 0;
                         if (!s1_rec.addr_hashes.empty() && !target.addr_hashes.empty()) {
@@ -875,6 +868,11 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
+                        // Missing Address Indicator: check if either record lacks address data
+                        bool s1_has_addr = !s1_rec.street_nums.empty() || !s1_rec.postal_code.empty() || !s1_rec.addr_hashes.empty();
+                        bool tgt_has_addr = !target.street_nums.empty() || !target.postal_code.empty() || !target.addr_hashes.empty();
+                        bool missing_addr = (!s1_has_addr || !tgt_has_addr);
+
                         // Composite Discriminator Score with Singleton Protections
                         double score = base_name;
                         if (postal_agree == 1) score += rules.postal_bonus;
@@ -886,14 +884,20 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                         if (addr_agree == 1) score += rules.addr_bonus;
                         else if (addr_agree == -1) score += rules.addr_penalty;
 
+                        // Graceful degradation when address information is missing
+                        if (missing_addr) {
+                            score -= 0.15;
+                        }
+
                         // Hard penalties for compound contradictions (prevents spurious singleton matches)
                         if (postal_agree == -1 && addr_agree == -1) score -= 0.30;
                         if (sn_agree == -1 && addr_agree == -1) score -= 0.30;
                         if (postal_agree == -1 && sn_agree == -1) score -= 0.30;
 
                         // Uncorroborated Non-Exact Name Penalty
-                        if (base_name < 0.95 && postal_agree <= 0 && sn_agree <= 0 && addr_agree <= 0) {
-                            score -= 0.25;
+                        // If root names are not virtually identical (< 0.98) and there is zero positive corroboration
+                        if (base_name < 0.98 && postal_agree <= 0 && sn_agree <= 0 && addr_agree <= 0) {
+                            score -= 0.35;
                         }
 
                         return std::max(0.0, std::min(1.0, score));
@@ -951,13 +955,17 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                     // Reset touched S3 in scratch buffer
                     for (uint32_t tid : touched_s3) overlap_counts[tid] = 0;
 
-                    // Sort initial S2 and S3 candidates
-                    std::sort(s2_scores.begin(), s2_scores.end(), [](const auto& a, const auto& b) {
-                        return a.second > b.second;
-                    });
-                    std::sort(s3_scores.begin(), s3_scores.end(), [](const auto& a, const auto& b) {
-                        return a.second > b.second;
-                    });
+                    // Deterministic Candidate Comparator: score descending, then target entity ID ascending
+                    // Strict weak ordering: exact comparison prevents transitivity violations in std::sort
+                    auto cand_cmp = [&](const std::pair<uint32_t, double>& a, const std::pair<uint32_t, double>& b) {
+                        if (a.second != b.second) {
+                            return a.second > b.second;
+                        }
+                        return target_index.records[a.first].id < target_index.records[b.first].id;
+                    };
+
+                    std::sort(s2_scores.begin(), s2_scores.end(), cand_cmp);
+                    std::sort(s3_scores.begin(), s3_scores.end(), cand_cmp);
 
                     // ========================================================
                     // 3. Tripartite Cross-Verification & Transitive Candidate Expansion
@@ -977,7 +985,17 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     }
                                     if (!exists) {
                                         const auto& s3_rec = target_index.records[tid];
-                                        double trans_score = compute_score(s1, s3_rec, 9999);
+                                        int actual_overlap = 0;
+                                        if (!s1.root_name.empty() && s1.root_name == s3_rec.root_name) {
+                                            actual_overlap = 9999;
+                                        } else {
+                                            for (const auto& tok1 : s1.tokens) {
+                                                for (const auto& tok2 : s3_rec.tokens) {
+                                                    if (tok1 == tok2) { actual_overlap++; break; }
+                                                }
+                                            }
+                                        }
+                                        double trans_score = compute_score(s1, s3_rec, actual_overlap);
                                         if (trans_score >= rules.min_candidate_score) {
                                             s3_scores.emplace_back(tid, trans_score);
                                         }
@@ -1005,10 +1023,8 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
-                        // Re-sort S3 scores after boost
-                        std::sort(s3_scores.begin(), s3_scores.end(), [](const auto& a, const auto& b) {
-                            return a.second > b.second;
-                        });
+                        // Re-sort S3 scores after boost with deterministic comparator
+                        std::sort(s3_scores.begin(), s3_scores.end(), cand_cmp);
                     }
 
                     // Transitive expansion from S3 to S2 if S3 had a high-confidence match
@@ -1024,7 +1040,17 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                                     }
                                     if (!exists) {
                                         const auto& s2_rec = target_index.records[tid];
-                                        double trans_score = compute_score(s1, s2_rec, 9999);
+                                        int actual_overlap = 0;
+                                        if (!s1.root_name.empty() && s1.root_name == s2_rec.root_name) {
+                                            actual_overlap = 9999;
+                                        } else {
+                                            for (const auto& tok1 : s1.tokens) {
+                                                for (const auto& tok2 : s2_rec.tokens) {
+                                                    if (tok1 == tok2) { actual_overlap++; break; }
+                                                }
+                                            }
+                                        }
+                                        double trans_score = compute_score(s1, s2_rec, actual_overlap);
                                         if (trans_score >= rules.min_candidate_score) {
                                             s2_scores.emplace_back(tid, trans_score);
                                         }
@@ -1052,46 +1078,81 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
                             }
                         }
 
-                        std::sort(s2_scores.begin(), s2_scores.end(), [](const auto& a, const auto& b) {
-                            return a.second > b.second;
-                        });
+                        std::sort(s2_scores.begin(), s2_scores.end(), cand_cmp);
                     }
 
                     // ========================================================
-                    // 4. Balanced Selection (Top S2 + Top S3)
+                    // 4. Candidate & Match Selection (Disciplined, Canonical & Sorted)
                     // ========================================================
-                    size_t s2_cap = rules.max_candidates_per_entity / 2;
-                    size_t s3_cap = rules.max_candidates_per_entity - s2_cap;
+                    // Hard Rule: NEVER discard a valid match (score >= match_threshold) due to candidate caps!
+                    std::vector<std::string> s2_matches;
+                    std::vector<std::string> s3_matches;
+                    std::unordered_set<uint32_t> match_tids;
 
-                    size_t s2_take = std::min(s2_cap, s2_scores.size());
-                    size_t s3_take = std::min(s3_cap, s3_scores.size());
-
-                    if (s2_take < s2_cap) {
-                        s3_take = std::min(s3_scores.size(), rules.max_candidates_per_entity - s2_take);
-                    } else if (s3_take < s3_cap) {
-                        s2_take = std::min(s2_scores.size(), rules.max_candidates_per_entity - s3_take);
+                    for (const auto& sc : s2_scores) {
+                        if (sc.second >= rules.match_threshold) {
+                            s2_matches.push_back(target_index.records[sc.first].id);
+                            match_tids.insert(sc.first);
+                        }
                     }
+                    for (const auto& sc : s3_scores) {
+                        if (sc.second >= rules.match_threshold) {
+                            s3_matches.push_back(target_index.records[sc.first].id);
+                            match_tids.insert(sc.first);
+                        }
+                    }
+
+                    // Sort matches canonically: S2 matches ascending, S3 matches ascending
+                    std::sort(s2_matches.begin(), s2_matches.end());
+                    std::sort(s3_matches.begin(), s3_matches.end());
+
+                    std::vector<std::string> matches;
+                    matches.reserve(s2_matches.size() + s3_matches.size());
+                    for (const auto& mid : s2_matches) matches.push_back(mid);
+                    for (const auto& mid : s3_matches) matches.push_back(mid);
+
+                    // Candidate Selection:
+                    // Hard Rule: Every match MUST be in candidates (strict subset property).
+                    // If matches count < rules.max_candidates_per_entity, fill remaining slots
+                    // with the highest-scoring non-match candidates from both sources.
+                    std::vector<std::string> s2_cands = s2_matches;
+                    std::vector<std::string> s3_cands = s3_matches;
+
+                    size_t current_cands = matches.size();
+                    if (current_cands < rules.max_candidates_per_entity) {
+                        std::vector<std::pair<uint32_t, double>> non_matches;
+                        for (const auto& sc : s2_scores) {
+                            if (match_tids.find(sc.first) == match_tids.end()) {
+                                non_matches.push_back(sc);
+                            }
+                        }
+                        for (const auto& sc : s3_scores) {
+                            if (match_tids.find(sc.first) == match_tids.end()) {
+                                non_matches.push_back(sc);
+                            }
+                        }
+                        std::sort(non_matches.begin(), non_matches.end(), cand_cmp);
+
+                        size_t needed = rules.max_candidates_per_entity - current_cands;
+                        size_t take = std::min(needed, non_matches.size());
+                        for (size_t i = 0; i < take; ++i) {
+                            const auto& rec = target_index.records[non_matches[i].first];
+                            if (rec.id.rfind("S2-", 0) == 0) {
+                                s2_cands.push_back(rec.id);
+                            } else {
+                                s3_cands.push_back(rec.id);
+                            }
+                        }
+                    }
+
+                    // Sort candidates canonically: S2 candidates ascending, S3 candidates ascending
+                    std::sort(s2_cands.begin(), s2_cands.end());
+                    std::sort(s3_cands.begin(), s3_cands.end());
 
                     std::vector<std::string> cands;
-                    std::vector<std::string> matches;
-                    cands.reserve(rules.max_candidates_per_entity);
-                    matches.reserve(rules.max_candidates_per_entity);
-
-                    for (size_t i = 0; i < s2_take; ++i) {
-                        const std::string& tid_str = target_index.records[s2_scores[i].first].id;
-                        cands.push_back(tid_str);
-                        if (s2_scores[i].second >= rules.match_threshold) {
-                            matches.push_back(tid_str);
-                        }
-                    }
-
-                    for (size_t i = 0; i < s3_take; ++i) {
-                        const std::string& tid_str = target_index.records[s3_scores[i].first].id;
-                        cands.push_back(tid_str);
-                        if (s3_scores[i].second >= rules.match_threshold) {
-                            matches.push_back(tid_str);
-                        }
-                    }
+                    cands.reserve(s2_cands.size() + s3_cands.size());
+                    for (const auto& cid : s2_cands) cands.push_back(cid);
+                    for (const auto& cid : s3_cands) cands.push_back(cid);
 
                     s1_candidates[s1_idx] = std::move(cands);
                     s1_matches[s1_idx] = std::move(matches);
@@ -1104,7 +1165,7 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
         }
     }
 
-    // Step 3: Stream Serializing to Output TSVs in Exact S1 Order
+    // Step 3: Stream Serializing to Output TSVs in Strictly Sorted S1 Order
     std::ofstream cand_out(candidate_output_path);
     std::ofstream match_out(matching_output_path);
 
@@ -1118,14 +1179,21 @@ EXPORT_API const char* run_entity_resolution_pipeline_cpp(
     cand_out << "source1_entity_id\tcandidate_entity_ids\n";
     match_out << "source1_entity_id\tmatched_entity_ids\n";
 
+    // Strictly sort output rows alphabetically by source1_entity_id
+    std::vector<size_t> sorted_s1_indices(total_s1);
+    std::iota(sorted_s1_indices.begin(), sorted_s1_indices.end(), 0);
+    std::sort(sorted_s1_indices.begin(), sorted_s1_indices.end(), [&](size_t a, size_t b) {
+        return s1_records[a].id < s1_records[b].id;
+    });
+
     size_t total_cand_links = 0;
     size_t total_matched_links = 0;
     size_t singletons_count = 0;
 
-    for (size_t i = 0; i < total_s1; ++i) {
-        const std::string& s1_id = s1_records[i].id;
-        const auto& cands = s1_candidates[i];
-        const auto& matches = s1_matches[i];
+    for (size_t idx : sorted_s1_indices) {
+        const std::string& s1_id = s1_records[idx].id;
+        const auto& cands = s1_candidates[idx];
+        const auto& matches = s1_matches[idx];
 
         total_cand_links += cands.size();
         total_matched_links += matches.size();
@@ -1319,7 +1387,8 @@ EXPORT_API const char* query_entity_resolution_cpp(
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
     });
 
     std::ostringstream ss;
@@ -1328,14 +1397,18 @@ EXPORT_API const char* query_entity_resolution_cpp(
         if (i > 0) ss << ",";
         ss << "{\"id\": \"" << candidates[i].first << "\", \"score\": " << candidates[i].second << "}";
     }
-    ss << "], \"matches\": [";
-    bool first_m = true;
-    for (size_t i = 0; i < std::min((size_t)25, candidates.size()); ++i) {
-        if (candidates[i].second >= match_threshold) {
-            if (!first_m) ss << ",";
-            ss << "\"" << candidates[i].first << "\"";
-            first_m = false;
+    std::vector<std::string> query_matches;
+    for (const auto& cand : candidates) {
+        if (cand.second >= match_threshold) {
+            query_matches.push_back(cand.first);
         }
+    }
+    std::sort(query_matches.begin(), query_matches.end());
+
+    ss << "], \"matches\": [";
+    for (size_t i = 0; i < query_matches.size(); ++i) {
+        if (i > 0) ss << ",";
+        ss << "\"" << query_matches[i] << "\"";
     }
     ss << "]}";
 

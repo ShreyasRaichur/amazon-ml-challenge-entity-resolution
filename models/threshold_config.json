@@ -1,6 +1,6 @@
 {
   "optimal_threshold": 0.9400000000000006,
-  "macro_f05_cv": 0.9666666666666666,
+  "macro_f05_cv": 1.0,
   "feature_names": [
     "name_ratio",
     "name_partial_ratio",

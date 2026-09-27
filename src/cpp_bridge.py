@@ -275,7 +275,7 @@ class CPPEngine:
             return LegalEntityNormalizer().parse(clean_name)
 
         root_buf = ctypes.create_string_buffer(1024)
-        legal_buf = ctypes.create_string_buffer(256)
+        legal_buf = ctypes.create_string_buffer(1024)
         cls._lib.parse_legal_suffix_cpp(clean_name.encode("utf-8"), root_buf, legal_buf, 1024)
         return root_buf.value.decode("utf-8", errors="ignore"), legal_buf.value.decode("utf-8", errors="ignore")
 

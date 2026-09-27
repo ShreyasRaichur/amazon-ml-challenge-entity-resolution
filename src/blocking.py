@@ -6,6 +6,11 @@ partitioned dynamically by country to achieve ultra-high recall under distributi
 
 from __future__ import annotations
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
@@ -30,23 +35,22 @@ class FaissOrSklearnIndex:
         self.dim = dim
         self.use_faiss = False
         self.faiss_index = None
-        self.sklearn_index = None
+        self.sklearn_index = NearestNeighbors(metric="cosine", algorithm="brute")
         self.vectors: Optional[np.ndarray] = None
 
         try:
             import faiss
             self.faiss_index = faiss.IndexFlatIP(dim)
             self.use_faiss = True
-        except ImportError:
+        except Exception:
             self.use_faiss = False
-            self.sklearn_index = NearestNeighbors(metric="cosine", algorithm="brute")
 
     def add(self, vectors: np.ndarray) -> None:
         """Add normalized vectors to the index."""
         # Ensure float32 and L2 normalization
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        normalized = (vectors / norms).astype(np.float32)
+        normalized = np.ascontiguousarray((vectors / norms), dtype=np.float32)
 
         if self.use_faiss and self.faiss_index is not None:
             self.faiss_index.add(normalized)
@@ -58,10 +62,14 @@ class FaissOrSklearnIndex:
         """Search top-k nearest neighbors. Returns (distances, indices)."""
         norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        normalized = (query_vectors / norms).astype(np.float32)
+        normalized = np.ascontiguousarray((query_vectors / norms), dtype=np.float32)
 
         if self.use_faiss and self.faiss_index is not None:
-            distances, indices = self.faiss_index.search(normalized, top_k)
+            if self.faiss_index.ntotal == 0:
+                n_queries = len(query_vectors)
+                return np.zeros((n_queries, 0), dtype=np.float32), np.full((n_queries, 0), -1, dtype=np.int64)
+            actual_k = min(top_k, self.faiss_index.ntotal)
+            distances, indices = self.faiss_index.search(normalized, actual_k)
             return distances, indices
         else:
             actual_k = min(top_k, len(self.vectors)) if self.vectors is not None else 0
